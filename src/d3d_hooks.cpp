@@ -1153,6 +1153,8 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.mainTarget = g_renderTarget0 == g_backBuffer;
   d.texture0 = g_texture0;
   d.texture1 = g_texture1;
+  for (int s = 0; s < 8; ++s)
+    d.stageTextures[s] = g_textures[s];
   d.colorWrite = g_renderStates[D3DRS_COLORWRITEENABLE];
   d.blend = g_renderStates[D3DRS_ALPHABLENDENABLE] != 0;
   d.srcBlend = g_renderStates[D3DRS_SRCBLEND];

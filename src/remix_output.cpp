@@ -72,7 +72,7 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
@@ -659,6 +659,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     float pbr[8];
     uint8_t pbrBits[3];
     uint8_t nearest;
+    uint16_t albedo[3]; // Shading::albedo, 1/1024 steps
   } key;
   std::memset(&key, 0, sizeof(key)); // hashed as bytes
   key.mask = maskHash;
@@ -668,6 +669,8 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   key.mode = uint8_t(s.mode);
   key.lights = lights;
   key.nearest = nearest ? 1 : 0;
+  for (int c = 0; c < 3; ++c)
+    key.albedo[c] = uint16_t(std::lround(std::clamp(std::isfinite(s.albedo[c]) ? s.albedo[c] : 1.0f, 0.0f, 1.0f) * 1024));
   if (pbr.use) {
     const auto &p = s.pbr;
     key.normal = pbr.normal;
@@ -746,7 +749,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
       opaque.metallicTexture = mapPaths[1];
   }
   opaque.pNext = chain;
-  opaque.albedoConstant = {1, 1, 1};
+  opaque.albedoConstant = {key.albedo[0] / 1024.0f, key.albedo[1] / 1024.0f, key.albedo[2] / 1024.0f};
   opaque.opacityConstant = 1;
   opaque.alphaTestType = 7;
   opaque.useDrawCallAlphaState = 1;
@@ -795,7 +798,8 @@ void countPbr(const PbrMaps &maps) {
 // with the material's PBR conversion.
 remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s, bool nearest = false) {
   using engine_materials::Shading;
-  if (s.mode == Shading::Lit && !s.pbr.active)
+  const bool tinted = s.albedo[0] != 1 || s.albedo[1] != 1 || s.albedo[2] != 1;
+  if (s.mode == Shading::Lit && !s.pbr.active && !tinted)
     return materialFor(texture, 0, nearest);
   const bool masked = s.mode == Shading::SelfIllumMask || s.mode == Shading::SelfIllumMaskAlpha;
   const uint64_t maskHash = masked ? maskTextureHash(s.mask) : 0;
@@ -820,7 +824,7 @@ remixapi_MaterialHandle materialFor(const void *texture, const engine_materials:
     return ensureMaterial(*it->second, 0, nearest);
   }
   if (s.mode == Shading::Lit) {
-    if (!maps.use)
+    if (!maps.use && !tinted)
       return ensureMaterial(*it->second, 0, nearest);
     if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, 0, false, nullptr, maps, nearest)) {
       countPbr(maps);
@@ -2087,6 +2091,85 @@ void probeMaterialDraw(const void *texture, const engine_materials::Shading &bou
           taken.base.c_str(), int(taken.pbr.active), taken.pbr.normal.c_str(), taken.pbr.maps[0].texture.c_str(),
           taken.pbr.maps[0].channel, taken.pbr.maps[0].bias, taken.pbr.maps[0].scale, taken.pbr.roughness,
           additive ? " additive" : "", multiply ? " multiply" : "");
+  fclose(out);
+}
+
+// Dev aid: bin/shaderapi_proxy_shader.request names a shader
+// ("shatteredglass"); its next 64 draws are described in bin/shader_probe.txt:
+// the material, its $basetexture as bound (after material proxies), each
+// sampler's texture (hash; whether the runtime has it), blending and the
+// shading taken.
+struct ShaderProbe {
+  std::string shader;
+  uint32_t left = 0;
+} g_shaderProbe; // render thread
+void serviceShaderProbeRequest() {
+  if (g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_shader.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  std::string name;
+  if (FILE *in = _wfopen(request.c_str(), L"r")) {
+    char line[256] = {};
+    if (std::fgets(line, sizeof(line), in))
+      name = line;
+    fclose(in);
+  }
+  DeleteFileW(request.c_str());
+  while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+    name.pop_back();
+  for (char &c : name)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  g_shaderProbe.shader = name;
+  g_shaderProbe.left = name.empty() ? 0 : 64;
+  if (FILE *out = _wfopen((g_moduleDir + L"\\shader_probe.txt").c_str(), L"w")) {
+    fprintf(out, "== shader %s, from frame %llu\n", name.c_str(), static_cast<unsigned long long>(g_frame));
+    fclose(out);
+  }
+}
+void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
+  if (!g_shaderProbe.left)
+    return;
+  const auto &b = engine_materials::bound();
+  if (!b.known)
+    return;
+  std::string shader = b.shader;
+  for (char &c : shader)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  if (shader.rfind(g_shaderProbe.shader, 0) != 0)
+    return;
+  --g_shaderProbe.left;
+  FILE *out = _wfopen((g_moduleDir + L"\\shader_probe.txt").c_str(), L"a");
+  if (!out)
+    return;
+  fprintf(out, "f%llu %s (%s, translucent %d alphaTest %d) base \"%s\" | blend %d %u/%u alphaTest %d | taken mode %d base \"%s\" | verts %u prims %u\n",
+          static_cast<unsigned long long>(g_frame), engine_materials::currentName(), b.shader, int(b.translucent),
+          int(b.alphaTest), engine_materials::current().base.c_str(), int(d.blend), d.srcBlend, d.dstBlend, int(d.alphaTest),
+          int(taken.mode), taken.base.c_str(), d.numVertices, d.primCount);
+  // The vertex layout, and the first vertex's texture coordinates.
+  if (d.elements) {
+    fprintf(out, "   elements:");
+    for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff; ++e) {
+      fprintf(out, " s%u+%u u%u.%u t%u", e->Stream, e->Offset, e->Usage, e->UsageIndex, e->Type);
+      const auto &st = d.streams[e->Stream < 4 ? e->Stream : 0];
+      const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * st.stride + e->Offset;
+      if (e->Usage == D3DDECLUSAGE_TEXCOORD && e->Stream < 4 && st.data && e->Type <= D3DDECLTYPE_FLOAT4 &&
+          at + (e->Type + 1) * 4 <= st.size) {
+        float v[4] = {};
+        std::memcpy(v, st.data + at, (e->Type + 1) * 4);
+        fprintf(out, "=(%.3g %.3g %.3g %.3g)", v[0], v[1], v[2], v[3]);
+      }
+    }
+    fprintf(out, "\n");
+  }
+  for (int s = 0; s < 8; ++s)
+    if (d.stageTextures[s]) {
+      const uint64_t hash = textureHash(d.stageTextures[s]);
+      std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+      fprintf(out, "   s%d %p hash %016llX%s\n", s, d.stageTextures[s], static_cast<unsigned long long>(hash),
+              hash && uploadedTextureHash(hash) ? " (runtime has it)" : hash ? "" : " (no upload seen)");
+    }
   fclose(out);
 }
 
@@ -3422,11 +3505,211 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
   return outcome != kParticleFailed || kind == kParticleExpanded;
 }
 
+// ShatteredGlass edge pieces (onDraw): Source's shader multiplies the glass
+// ($detail, on the window's coordinates) by the piece's shape mask (on its
+// own). A runtime material has one set of coordinates, so each piece quad
+// gets a texture of the two composed on the mask's coordinates. Render thread.
+struct ShardSource {
+  uint32_t width = 0, height = 0;
+  std::vector<uint8_t> rgba;
+};
+const ShardSource *shardSource(const std::string &name) {
+  static std::unordered_map<std::string, std::unique_ptr<ShardSource>> images;
+  auto [it, added] = images.try_emplace(name);
+  if (added) {
+    auto image = std::make_unique<ShardSource>();
+    if (bsp::textureRgba(name, image->width, image->height, image->rgba) && image->width && image->height)
+      it->second = std::move(image);
+  }
+  return it->second.get();
+}
+struct ShardTexture {
+  std::unique_ptr<uint8_t> identity; // the key standing for a D3D texture in g_textures
+  uint64_t lastFrame = 0;
+};
+std::unordered_map<uint64_t, ShardTexture> g_shardTextures;
+bool g_inShardDraw = false; // drawing a piece's quad with its composed texture
+// `map`: the glass coordinates over the mask's, glass = (map[0], map[1]) +
+// mask.x * (map[2], map[3]) + mask.y * (map[4], map[5]).
+const void *shardTexture(const std::string &mask, const std::string &glass, const float map[6]) {
+  float key[6];
+  for (int i = 0; i < 6; ++i)
+    key[i] = std::round(map[i] * 4096) / 4096;
+  uint64_t hash = XXH3_64bits_withSeed(key, sizeof(key), XXH3_64bits(mask.data(), mask.size()));
+  hash = XXH3_64bits_withSeed(glass.data(), glass.size(), hash) | 1;
+  auto &entry = g_shardTextures[hash];
+  entry.lastFrame = g_frame;
+  if (entry.identity)
+    return entry.identity.get();
+  const ShardSource *m = shardSource(mask), *g = shardSource(glass);
+  if (!m || !g) {
+    g_shardTextures.erase(hash);
+    return nullptr;
+  }
+  const uint32_t width = std::min(m->width, 128u), height = std::min(m->height, 128u);
+  std::vector<uint8_t> out(size_t(width) * height * 4);
+  for (uint32_t y = 0; y < height; ++y)
+    for (uint32_t x = 0; x < width; ++x) {
+      const float u = (x + 0.5f) / width, v = (y + 0.5f) / height;
+      const uint8_t *mt = &m->rgba[(size_t(std::min(uint32_t(v * m->height), m->height - 1)) * m->width +
+                                    std::min(uint32_t(u * m->width), m->width - 1)) * 4];
+      float gu = map[0] + u * map[2] + v * map[4], gv = map[1] + u * map[3] + v * map[5];
+      gu -= std::floor(gu);
+      gv -= std::floor(gv);
+      if (!std::isfinite(gu) || !std::isfinite(gv))
+        gu = gv = 0;
+      const uint8_t *gt = &g->rgba[(size_t(std::min(uint32_t(gv * g->height), g->height - 1)) * g->width +
+                                    std::min(uint32_t(gu * g->width), g->width - 1)) * 4];
+      uint8_t *o = &out[(size_t(y) * width + x) * 4];
+      o[0] = gt[0];
+      o[1] = gt[1];
+      o[2] = gt[2];
+      o[3] = uint8_t((unsigned(gt[3]) * mt[3] + 127) / 255);
+    }
+  auto t = std::make_shared<RemixTexture>();
+  t->hash = hash;
+  remixapi_TextureInfoGenerateMipsEXT mips = {};
+  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
+  mips.generate = true;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.pNext = &mips;
+  info.hash = hash;
+  info.width = width;
+  info.height = height;
+  info.depth = 1;
+  info.mipLevels = 1;
+  info.format = REMIXAPI_FORMAT_R8G8B8A8_SRGB;
+  info.data = out.data();
+  info.dataSize = out.size();
+  if (g_api.CreateTexture(&info, &t->texture) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_shardTextures.erase(hash);
+    return nullptr;
+  }
+  ++g_stats.shatteredTextures;
+  entry.identity = std::make_unique<uint8_t>(0);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  g_texturesByHash[hash] = t;
+  g_textures[entry.identity.get()] = std::move(t);
+  // Pieces of windows long out of sight go (a few dozen per window).
+  if (g_shardTextures.size() > 1024)
+    for (auto it = g_shardTextures.begin(); it != g_shardTextures.end();)
+      if (g_frame - it->second.lastFrame > 600) {
+        g_textures.erase(it->second.identity.get());
+        g_texturesByHash.erase(it->first);
+        it = g_shardTextures.erase(it);
+      } else
+        ++it;
+  return entry.identity.get();
+}
+
+// A ShatteredGlass edge piece's quads, each drawn with its composed texture
+// (shardTexture). False when the draw is not quads of the two coordinate sets.
+void onDraw(const Draw &d);
+bool drawShardQuads(const Draw &d, const std::string &mask, const std::string &glass) {
+  const auto *maskCoord = findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 0);
+  const auto *glassCoord = findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 2);
+  if (d.type != D3DPT_TRIANGLELIST || !d.indices.data || d.primCount % 2 || !maskCoord || !glassCoord ||
+      maskCoord->Type != D3DDECLTYPE_FLOAT2 || glassCoord->Type != D3DDECLTYPE_FLOAT2)
+    return false;
+  const auto fetch = [&](const D3DVERTEXELEMENT9 *e, uint32_t index, float out[2]) {
+    if (e->Stream >= 4)
+      return false;
+    const auto &s = d.streams[e->Stream];
+    const int64_t vertex = int64_t(d.baseVertex) + index;
+    const uint64_t at = uint64_t(s.offset) + uint64_t(vertex) * s.stride + e->Offset;
+    if (!s.data || vertex < 0 || at + 8 > s.size)
+      return false;
+    std::memcpy(out, s.data + at, 8);
+    return std::isfinite(out[0]) && std::isfinite(out[1]);
+  };
+  // Every quad's map first: a piece is drawn whole or not at all.
+  const uint32_t quads = d.primCount / 2;
+  std::vector<const void *> textures(quads);
+  for (uint32_t q = 0; q < quads; ++q) {
+    const uint64_t first = uint64_t(d.startIndex) + q * 6;
+    const uint32_t bytes = d.indices.is32 ? 4 : 2;
+    if ((first + 3) * bytes > d.indices.size)
+      return false;
+    float m[3][2], g[3][2];
+    for (int k = 0; k < 3; ++k) {
+      uint32_t index = 0;
+      std::memcpy(&index, d.indices.data + (first + k) * bytes, bytes);
+      if (!fetch(maskCoord, index, m[k]) || !fetch(glassCoord, index, g[k]))
+        return false;
+    }
+    // The affine map of the first triangle (the quad is a parallelogram).
+    const float a = m[1][0] - m[0][0], b = m[2][0] - m[0][0], c = m[1][1] - m[0][1], e = m[2][1] - m[0][1];
+    const float det = a * e - b * c;
+    if (!(std::fabs(det) > 1e-8f))
+      return false;
+    float map[6];
+    for (int axis = 0; axis < 2; ++axis) {
+      const float p = g[1][axis] - g[0][axis], r = g[2][axis] - g[0][axis];
+      const float du = (p * e - r * c) / det, dv = (r * a - p * b) / det; // d glass / d mask.x, mask.y
+      map[2 + axis] = du;
+      map[4 + axis] = dv;
+      map[axis] = g[0][axis] - du * m[0][0] - dv * m[0][1];
+    }
+    if (!(textures[q] = shardTexture(mask, glass, map)))
+      return false;
+  }
+  g_inShardDraw = true;
+  for (uint32_t q = 0; q < quads; ++q) {
+    Draw piece = d;
+    piece.startIndex = d.startIndex + q * 6;
+    piece.primCount = 2;
+    piece.texture0 = textures[q];
+    onDraw(piece);
+  }
+  g_inShardDraw = false;
+  ++g_stats.shatteredEdges;
+  return true;
+}
+
 void onDraw(const Draw &d) {
   Timer timer(g_usDraw, &g_totalUs[0]);
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
     return;
+  // ShatteredGlass (a broken func_breakable_surf): each piece binds a shape
+  // mask as $basetexture (the BreakableSurface proxy's models/brokenglass/
+  // glassbroken_*: white, the shape in alpha, on TEXCOORD0) and the glass
+  // itself as $detail (sampler 3, on the window's TEXCOORD2); the shader
+  // multiplies them. Taken alone, the white mask made the pane white. A whole
+  // block (its mask solid) is drawn as the glass; an edge piece keeps its
+  // mask (the jagged outline) with the glass's mean colour.
+  float shatteredTint[4] = {1, 1, 1, 1};
+  bool shatteredEdge = false;
+  if (const auto &m = engine_materials::bound();
+      !g_inShardDraw && m.known && nameStarts(m.shader, "shatteredglass") && d.stageTextures[3] &&
+      d.texture0 != d.stageTextures[3] && d.elements && findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 2)) {
+    const std::string &mask = engine_materials::current().base;
+    if (mask.size() >= 6 && mask.compare(mask.size() - 6, 6, "_solid") == 0) {
+      static D3DVERTEXELEMENT9 remapped[65]; // render thread
+      size_t n = 0;
+      for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff && n < 64; ++e, ++n) {
+        remapped[n] = *e;
+        if (e->Usage == D3DDECLUSAGE_TEXCOORD && (e->UsageIndex == 0 || e->UsageIndex == 2))
+          remapped[n].UsageIndex = BYTE(2 - e->UsageIndex);
+      }
+      remapped[n] = D3DVERTEXELEMENT9{0xff, 0, D3DDECLTYPE_UNUSED, 0, 0, 0}; // D3DDECL_END
+      Draw glass = d;
+      glass.texture0 = d.stageTextures[3];
+      glass.elements = remapped;
+      ++g_stats.shatteredSolid;
+      onDraw(glass);
+      return;
+    }
+    const std::string detail = engine_materials::currentTextureName("$detail");
+    if (!detail.empty() && drawShardQuads(d, mask, detail))
+      return;
+    // Else the mask, in the glass's mean colour.
+    if (!detail.empty() && bsp::textureMeanColor(detail, shatteredTint)) {
+      shatteredEdge = true;
+      ++g_stats.shatteredTinted;
+    }
+  }
   // $fogmaxdensity of the view being drawn (see SceneFog): cFogParams.z of a
   // world draw whose vertex shader computes fog.
   if (g_worldLists > 0 && d.mainTarget && d.vertexProgram && d.vsConstants) {
@@ -3808,7 +4091,10 @@ void onDraw(const Draw &d) {
   engine_materials::Shading shading;
   if (!additiveDraw && !multiply)
     shading = shadingFor(d.texture0, engine_materials::current());
+  if (shatteredEdge)
+    std::copy_n(shatteredTint, 3, shading.albedo);
   probeMaterialDraw(d.texture0, engine_materials::current(), shading, additiveDraw, multiply);
+  probeShaderDraw(d, shading);
   if (shading.mode == engine_materials::Shading::Unlit)
     vb_origins::countUnlit(d.streams[0].buffer);
   // Lua-built meshes (a Lua Mesh(): InfMap terrain and scripted maps) are
@@ -5334,6 +5620,7 @@ void onPresent() {
   serviceScreenshotRequest();
   serviceFlatDumpRequest();
   serviceMaterialProbeRequest();
+  serviceShaderProbeRequest();
   // The first frames, for the diagnostics log: a crash while rendering shows
   // how far the game got.
   static uint32_t presents = 0;
@@ -6093,6 +6380,10 @@ void dumpStatistics(FILE *out) {
           g_stats.setLightKept[1].exchange(0) / f, g_stats.setLightKept[2].exchange(0) / f,
           g_stats.setLightKept[3].exchange(0) / f, g_stats.projectedCopies.exchange(0) / f,
           g_stats.lightCookies.exchange(0) / f, g_stats.lightCookieFrameMax.exchange(0));
+  fprintf(out, "   shattered glass per frame: solid blocks drawn as the glass %.1f, edge pieces composed %.1f, "
+               "tinted %.1f; composed textures made %u\n",
+          g_stats.shatteredSolid.exchange(0) / f, g_stats.shatteredEdges.exchange(0) / f,
+          g_stats.shatteredTinted.exchange(0) / f, g_stats.shatteredTextures.exchange(0));
   {
     std::lock_guard<std::mutex> lock(g_lightLock);
     for (auto &[h, l] : g_lastLights)

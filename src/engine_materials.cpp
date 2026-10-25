@@ -697,6 +697,24 @@ bool currentIsLitOpaque() {
   return flags && !(g_varInt(flags) & kFlagAdditive);
 }
 
+std::string currentTextureName(const char *name) {
+  const Entry *e = g_currentEntry;
+  if (!e)
+    return {};
+  for (int i = 0; i < e->count; ++i) {
+    void *var = paramAt(*e, i);
+    if (!var || varType(var) != kTypeTexture)
+      continue;
+    const char *varName = g_varName(var);
+    if (!varName || _stricmp(varName, name) != 0)
+      continue;
+    void *texture;
+    std::memcpy(&texture, static_cast<const uint8_t *>(var) + kVarTexture, sizeof(texture));
+    return textureNameOfTexture(texture);
+  }
+  return {};
+}
+
 bool currentFloat(const char *name, float &out) {
   const Entry *e = g_currentEntry;
   if (!e)

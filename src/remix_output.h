@@ -52,6 +52,7 @@ struct Draw {
   const vsprog::Program *vertexProgram = nullptr; // it, decoded (nullptr: not seen at creation)
   const void *texture0 = nullptr;              // texture bound to sampler 0 (base texture)
   const void *texture1 = nullptr;              // texture bound to sampler 1 (Eyes shader: the iris)
+  const void *stageTextures[8] = {};           // samplers 0-7 (diagnostics: the shader probe)
   bool mainTarget = false;                     // render target 0 is the back buffer
   uint32_t colorWrite = 0xf;                   // D3DRS_COLORWRITEENABLE
   bool blend = false;                          // D3DRS_ALPHABLENDENABLE

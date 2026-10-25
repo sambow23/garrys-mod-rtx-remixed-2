@@ -2932,6 +2932,38 @@ float textureLuminance(const std::string &name) {
   return value;
 }
 
+bool textureRgba(const std::string &name, uint32_t &width, uint32_t &height, std::vector<uint8_t> &rgba) {
+  ensureFileSystem();
+  std::vector<std::vector<uint8_t>> frames;
+  if (vtfFrames(name, width, height, frames) || frames.empty() ||
+      frames[0].size() != size_t(width) * height * 4)
+    return false;
+  rgba = std::move(frames[0]);
+  return true;
+}
+
+bool textureMeanColor(const std::string &name, float rgba[4]) {
+  static std::mutex lock;
+  static std::unordered_map<std::string, std::array<float, 5>> known; // rgba, found
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (auto it = known.find(name); it != known.end()) {
+      std::copy_n(it->second.begin(), 4, rgba);
+      return it->second[4] != 0;
+    }
+  }
+  ensureFileSystem();
+  std::array<float, 5> value = {1, 1, 1, 1, 0};
+  if (textureMean(name, value.data()))
+    value[4] = 1;
+  std::lock_guard<std::mutex> guard(lock);
+  if (known.size() > 8192)
+    known.clear();
+  known[name] = value;
+  std::copy_n(value.begin(), 4, rgba);
+  return value[4] != 0;
+}
+
 bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   std::string mapName = lower(requestedMap);
   if (mapName.rfind("maps/", 0) == 0)

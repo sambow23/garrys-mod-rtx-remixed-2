@@ -179,8 +179,10 @@ std::vector<remixapi_MeshHandle> g_transient; // destroyed after Present
 struct RemixTexture {
   remixapi_TextureHandle texture = nullptr;
   remixapi_MaterialHandle material = nullptr;
+  remixapi_MaterialHandle pointMaterial = nullptr; // nearest filter variant (pixel-art)
   remixapi_MaterialHandle skyMaterial = nullptr; // tinted by rtx.skyBrightness
   remixapi_MaterialHandle clampMaterial = nullptr; // clamp-to-edge variant (an eye's iris)
+  remixapi_MaterialHandle pointClampMaterial = nullptr; // nearest clamp variant
   float skyBrightness = 0;
   uint64_t hash = 0;
   // dxvk::legacyTextureHash of the upload (0: none): a second key mods may
@@ -295,15 +297,24 @@ void noteReplacementKey(uint64_t key, char kind = 'M') {
   }
 }
 
+// Whether a D3D9 sampler state requests point (nearest) filtering (e.g. for pixel-art).
+bool isPointSampler(const DWORD (*samplerStates)[16], uint32_t sampler = 0) {
+  if (!samplerStates || sampler >= 16)
+    return false;
+  const DWORD mag = samplerStates[sampler][D3DSAMP_MAGFILTER];
+  const DWORD min = samplerStates[sampler][D3DSAMP_MINFILTER];
+  return mag == D3DTEXF_POINT || min == D3DTEXF_POINT;
+}
+
 // `skyBrightness` > 0 selects the sky variant, whose tint scales the texture.
 // Caller holds g_textureLock.
-remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
+remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness, bool nearest = false) {
   const bool sky = skyBrightness > 0;
   if (sky && t.skyMaterial && t.skyBrightness != skyBrightness) {
     g_api.DestroyMaterial(t.skyMaterial);
     t.skyMaterial = nullptr;
   }
-  remixapi_MaterialHandle &slot = sky ? t.skyMaterial : t.material;
+  remixapi_MaterialHandle &slot = sky ? t.skyMaterial : (nearest ? t.pointMaterial : t.material);
   if (!slot) {
     wchar_t path[32];
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
@@ -324,9 +335,9 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
-    info.hash = sky ? t.hash ^ 0x5ca1ab1e5ca1ab1eull : t.hash;
+    info.hash = sky ? t.hash ^ 0x5ca1ab1e5ca1ab1eull : (nearest ? (t.hash ^ 0x701475a1701475a1ull ? t.hash ^ 0x701475a1701475a1ull : ~t.hash) : t.hash);
     info.albedoTexture = path;
-    info.filterMode = 1; // linear (0 is nearest)
+    info.filterMode = nearest ? 0 : 1; // linear (0 is nearest)
     info.wrapModeU = info.wrapModeV = 1;
     if (g_api.CreateMaterial(&info, &slot) != REMIXAPI_ERROR_CODE_SUCCESS)
       slot = nullptr;
@@ -336,10 +347,10 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
   return slot;
 }
 
-remixapi_MaterialHandle materialFor(const void *texture, float skyBrightness = 0) {
+remixapi_MaterialHandle materialFor(const void *texture, float skyBrightness = 0, bool nearest = false) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
-  return it == g_textures.end() ? nullptr : ensureMaterial(*it->second, skyBrightness);
+  return it == g_textures.end() ? nullptr : ensureMaterial(*it->second, skyBrightness, nearest);
 }
 
 float envScale(const char *name, float fallback);
@@ -383,10 +394,14 @@ RemixTexture::~RemixTexture() {
     return;
   if (material)
     g_api.DestroyMaterial(material);
+  if (pointMaterial)
+    g_api.DestroyMaterial(pointMaterial);
   if (skyMaterial)
     g_api.DestroyMaterial(skyMaterial);
   if (clampMaterial)
     g_api.DestroyMaterial(clampMaterial);
+  if (pointClampMaterial)
+    g_api.DestroyMaterial(pointClampMaterial);
   if (texture)
     g_api.DestroyTexture(texture);
 }
@@ -468,13 +483,14 @@ uint64_t maskTextureHash(const std::string &name, bool count = true, uint32_t fr
 // The texture's material sampled clamp-to-edge: an iris is projected onto the
 // whole eye and must not repeat beside itself (its border texels are
 // transparent). Otherwise as ensureMaterial.
-remixapi_MaterialHandle clampedMaterialFor(const void *texture) {
+remixapi_MaterialHandle clampedMaterialFor(const void *texture, bool nearest = false) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
   if (it == g_textures.end())
     return nullptr;
   RemixTexture &t = *it->second;
-  if (!t.clampMaterial) {
+  remixapi_MaterialHandle &slot = nearest ? t.pointClampMaterial : t.clampMaterial;
+  if (!slot) {
     wchar_t path[32];
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
     remixapi_MaterialInfoOpaqueEXT opaque = {};
@@ -486,28 +502,28 @@ remixapi_MaterialHandle clampedMaterialFor(const void *texture) {
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
-    info.hash = t.hash ^ 0xc1a3b0c1a3b0c1a3ull;
+    info.hash = nearest ? (t.hash ^ 0xc1a3b0c1a3b0c1a3ull ^ 0x701475a1701475a1ull) : (t.hash ^ 0xc1a3b0c1a3b0c1a3ull);
     info.albedoTexture = path;
-    info.filterMode = 1;
+    info.filterMode = nearest ? 0 : 1;
     info.wrapModeU = info.wrapModeV = 3; // clamp to edge (1: repeat)
-    if (g_api.CreateMaterial(&info, &t.clampMaterial) != REMIXAPI_ERROR_CODE_SUCCESS)
-      t.clampMaterial = nullptr;
+    if (g_api.CreateMaterial(&info, &slot) != REMIXAPI_ERROR_CODE_SUCCESS)
+      slot = nullptr;
   }
-  return t.clampMaterial;
+  return slot;
 }
 
 // The lit material of the uploaded texture a name stands for (nullptr: its
 // file gave no hashes, or none of them is uploaded now). For draws whose base
 // texture is not on sampler 0 (onDraw: the Cable shader). The record is held
 // by the engine's D3D texture (g_textures), as a draw's own texture's is.
-remixapi_MaterialHandle materialForName(const std::string &name) {
+remixapi_MaterialHandle materialForName(const std::string &name, bool nearest = false) {
   const uint64_t hash = name.empty() ? 0 : maskTextureHash(name, false);
   if (!hash)
     return nullptr;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   const auto found = g_texturesByHash.find(hash);
   const auto texture = found != g_texturesByHash.end() ? found->second.lock() : nullptr;
-  return texture ? ensureMaterial(*texture, 0) : nullptr;
+  return texture ? ensureMaterial(*texture, 0, nearest) : nullptr;
 }
 
 // A draw belongs to the material bound when it reaches D3D, usually. Not
@@ -626,7 +642,7 @@ PbrMaps pbrMapsFor(const RemixTexture &t, const engine_materials::Shading &s, bo
 // mask texture `maskHash` (0: none) and the PBR maps `pbr` (unused: diffuse).
 // Caller holds g_textureLock.
 EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shading &s, uint64_t maskHash, bool lights,
-                                 uint64_t *materialHash = nullptr, const PbrMaps &pbr = {}) {
+                                 uint64_t *materialHash = nullptr, const PbrMaps &pbr = {}, bool nearest = false) {
   using engine_materials::Shading;
   const bool emits = s.mode != Shading::Lit;
   static const float scale = envScale("OPENREMIX_PROXY_EMISSIVE_SCALE", 1.0f);
@@ -642,6 +658,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     uint64_t normal, maps[2];
     float pbr[8];
     uint8_t pbrBits[3];
+    uint8_t nearest;
   } key;
   std::memset(&key, 0, sizeof(key)); // hashed as bytes
   key.mask = maskHash;
@@ -650,6 +667,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     key.tint[c] = uint16_t(std::lround(std::clamp(std::isfinite(s.tint[c]) ? s.tint[c] : 0.0f, 0.0f, 64.0f) * 64));
   key.mode = uint8_t(s.mode);
   key.lights = lights;
+  key.nearest = nearest ? 1 : 0;
   if (pbr.use) {
     const auto &p = s.pbr;
     key.normal = pbr.normal;
@@ -745,7 +763,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     info.emissiveIntensity = scale;
     info.emissiveColorConstant = {key.tint[0] / 64.0f, key.tint[1] / 64.0f, key.tint[2] / 64.0f};
   }
-  info.filterMode = 1;
+  info.filterMode = nearest ? 0 : 1;
   info.wrapModeU = info.wrapModeV = 1;
   if (g_api.CreateMaterial(&info, &variant.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
     g_emissiveMaterials.erase(hash);
@@ -775,14 +793,14 @@ void countPbr(const PbrMaps &maps) {
 // A draw's material: the texture's lit one, or its unlit / self-illuminated
 // variant (falling back to the lit one when its mask texture is not known),
 // with the material's PBR conversion.
-remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s) {
+remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s, bool nearest = false) {
   using engine_materials::Shading;
   if (s.mode == Shading::Lit && !s.pbr.active)
-    return materialFor(texture);
+    return materialFor(texture, 0, nearest);
   const bool masked = s.mode == Shading::SelfIllumMask || s.mode == Shading::SelfIllumMaskAlpha;
   const uint64_t maskHash = masked ? maskTextureHash(s.mask) : 0;
   if (masked && !maskHash && !s.pbr.active)
-    return materialFor(texture);
+    return materialFor(texture, 0, nearest);
   const bool lights = emissiveLights(s, false);
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
@@ -794,23 +812,23 @@ remixapi_MaterialHandle materialFor(const void *texture, const engine_materials:
     Shading lit = s;
     lit.mode = Shading::Lit;
     if (!maps.use)
-      return ensureMaterial(*it->second, 0);
-    if (EmissiveMaterial *variant = ensureEmissive(*it->second, lit, 0, false, nullptr, maps)) {
+      return ensureMaterial(*it->second, 0, nearest);
+    if (EmissiveMaterial *variant = ensureEmissive(*it->second, lit, 0, false, nullptr, maps, nearest)) {
       countPbr(maps);
       return variant->handle;
     }
-    return ensureMaterial(*it->second, 0);
+    return ensureMaterial(*it->second, 0, nearest);
   }
   if (s.mode == Shading::Lit) {
     if (!maps.use)
-      return ensureMaterial(*it->second, 0);
-    if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, 0, false, nullptr, maps)) {
+      return ensureMaterial(*it->second, 0, nearest);
+    if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, 0, false, nullptr, maps, nearest)) {
       countPbr(maps);
       return variant->handle;
     }
-    return ensureMaterial(*it->second, 0);
+    return ensureMaterial(*it->second, 0, nearest);
   }
-  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights, nullptr, maps)) {
+  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights, nullptr, maps, nearest)) {
     countPbr(maps);
     switch (s.mode) {
     case Shading::Unlit: ++g_stats.unlitDraws; break;
@@ -821,7 +839,7 @@ remixapi_MaterialHandle materialFor(const void *texture, const engine_materials:
     g_stats.emissiveLightDraws += lights;
     return variant->handle;
   }
-  return ensureMaterial(*it->second, 0);
+  return ensureMaterial(*it->second, 0, nearest);
 }
 
 // Variants nothing drew for a while (a tint that changed) go; pinned ones
@@ -846,7 +864,7 @@ void evictEmissiveMaterials() {
 // `emission`: its unlit / self-illuminated variant, with the first uploaded
 // of `maskCandidates` as mask (no handle until that is uploaded).
 bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading *emission,
-                                 const std::vector<uint64_t> *maskCandidates) {
+                                 const std::vector<uint64_t> *maskCandidates, bool nearest = false) {
   using engine_materials::Shading;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_texturesByHash.find(hash);
@@ -862,7 +880,7 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   if (!complete)
     return {};
   if (!emission || (emission->mode == Shading::Lit && !maps.use)) {
-    ref.handle = ensureMaterial(*texture, 0);
+    ref.handle = ensureMaterial(*texture, 0, nearest);
     ref.keep = std::move(texture);
     return ref;
   }
@@ -876,7 +894,7 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   }
   uint64_t materialHash = 0;
   EmissiveMaterial *variant =
-      ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash, maps);
+      ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash, maps, nearest);
   if (!variant)
     return {};
   ++variant->pins;
@@ -1600,8 +1618,8 @@ void captureUi(const Draw &d) {
     for (int k = 0; k < 4; ++k)
       clip[k] = p[0] * mvp[k * 4] + p[1] * mvp[k * 4 + 1] + p[2] * mvp[k * 4 + 2] + mvp[k * 4 + 3];
     const float w = std::fabs(clip[3]) > 1e-6f ? clip[3] : 1.0f;
-    out.x = (clip[0] / w * 0.5f + 0.5f) * g_displayWidth;
-    out.y = (0.5f - clip[1] / w * 0.5f) * g_displayHeight;
+    out.x = (clip[0] / w * 0.5f + 0.5f) * g_displayWidth + 0.5f;
+    out.y = (0.5f - clip[1] / w * 0.5f) * g_displayHeight + 0.5f;
     if (tex && tex->Type >= D3DDECLTYPE_FLOAT2 && tex->Type <= D3DDECLTYPE_FLOAT4)
       if (const uint8_t *t = fetch(tex, v, 8)) {
         std::memcpy(&out.u, t, 4);
@@ -3318,13 +3336,14 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     inst.blend.textureAlphaOperation = 3;
     inst.blend.textureAlphaArg1Source = 1;
     inst.blend.textureAlphaArg2Source = 2;
+    const bool nearest = isPointSampler(d.samplerStates, 0);
     if (traced) {
       Shading shading;
       shading.mode = Shading::Unlit;
       shading.vertexColor = shading.vertexAlpha = true;
-      inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+      inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest) : nullptr;
     } else {
-      inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+      inst.material = d.texture0 ? materialFor(d.texture0, 0, nearest) : nullptr;
       inst.rasterOnly = true;
     }
     inst.particle = true;
@@ -4017,11 +4036,12 @@ void onDraw(const Draw &d) {
   // that is uploaded a rope goes untextured rather than normal-mapped. Their
   // COLOR0 is the lighting the engine sampled along the rope on the CPU, so
   // it is not forwarded: the path tracer lights them.
+  const bool nearest = isPointSampler(d.samplerStates, 0);
   if (bound.known && nameStarts(bound.shader, "cable")) {
-    inst.material = materialForName(engine_materials::current().base);
+    inst.material = materialForName(engine_materials::current().base, nearest);
     ++(inst.material ? g_stats.cableDraws : g_stats.cableNoBase);
   } else {
-    inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+    inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest) : nullptr;
   }
   if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
     ++g_stats.emissiveNoTexture;
@@ -4173,7 +4193,7 @@ void onDraw(const Draw &d) {
     ++g_stats.eyes;
     uint32_t eyeBones = 0;
     g_liftVertexStep = 0;
-    const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1);
+    const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
     const uint64_t eyeHash = (dynamicBuffers ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
     remixapi_MeshHandle eyeMesh =
         eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
@@ -4208,7 +4228,7 @@ void onDraw(const Draw &d) {
   // line has no surface.
   if (d.fillMode == D3DFILL_WIREFRAME) {
     inst.wireframe = inst.rasterOnly = true;
-    inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+    inst.material = d.texture0 ? materialFor(d.texture0, 0, nearest) : nullptr;
     inst.persistent = false;
     inst.depthTest = d.depthTest && inst.depthTest;
     inst.depthWrite = d.zWrite;
@@ -4232,7 +4252,7 @@ void onDraw(const Draw &d) {
     ++g_stats.eyes;
     uint32_t irisBones = 0;
     g_liftVertexStep = 0;
-    const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1);
+    const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
     // From buffers the engine rewrites (not seen for eyes) it stays per frame.
     const uint64_t irisHash = (dynamicBuffers ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
     remixapi_MeshHandle irisMesh =

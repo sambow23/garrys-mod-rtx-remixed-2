@@ -94,7 +94,7 @@ public:
         api.DestroyTexture(texture.handle);
   }
   bool complete() const { return failures.empty(); }
-  proxy::bsp::MaterialRef lookup(uint64_t sourceHash, const Shading *shading) {
+  proxy::bsp::MaterialRef lookup(uint64_t sourceHash, const Shading *shading, bool nearest) {
     std::string base;
     if (!proxy::bsp::materialSource(sourceHash, base)) {
       fail("texture hash " + std::to_string(sourceHash), "no VMT base texture");
@@ -103,7 +103,7 @@ public:
     // Include every static shading field: two VMTs may share their albedo.
     std::ostringstream key;
     key.precision(9);
-    key << base << ':' << sourceHash;
+    key << base << ':' << sourceHash << ':' << nearest;
     if (shading) {
       const auto &s = *shading;
       if (s.reflectionReceiverKey) key << ":receiver:" << s.reflectionReceiverKey;
@@ -173,7 +173,7 @@ public:
     info.albedoTexture = albedo.c_str();
     info.normalTexture = normal.empty() ? nullptr : normal.c_str();
     info.emissiveTexture = mask.empty() ? nullptr : mask.c_str();
-    info.filterMode = 1;
+    info.filterMode = nearest ? 0 : 1;
     info.wrapModeU = info.wrapModeV = 1;
     if (shading) {
       const auto &s = *shading;
@@ -276,8 +276,8 @@ private:
   }
 };
 Materials *currentMaterials = nullptr;
-proxy::bsp::MaterialRef lookup(uint64_t hash, const Shading *shading, const std::vector<uint64_t> *) {
-  return currentMaterials->lookup(hash, shading);
+proxy::bsp::MaterialRef lookup(uint64_t hash, const Shading *shading, const std::vector<uint64_t> *, bool nearest) {
+  return currentMaterials->lookup(hash, shading, nearest);
 }
 
 proxy::lighting::SourceLight sourceLight(const proxy::bsp::Light &source) {

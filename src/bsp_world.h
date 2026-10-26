@@ -28,7 +28,7 @@ struct MaterialRef {
 // illuminated variant, masked by the first uploaded texture among
 // maskCandidates (null handle while none of them is).
 using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materials::Shading *emission,
-                                       const std::vector<uint64_t> *maskCandidates);
+                                       const std::vector<uint64_t> *maskCandidates, bool nearest);
 
 // dxvk hashes a texture ("models/x/y", as materials name it) can be uploaded
 // under: its largest mips, from the VTF file. Empty: no file, or a format the

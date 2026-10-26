@@ -499,6 +499,20 @@ bool textureHasAlpha(const std::string &name) {
   return (flags & 0x3000) != 0;
 }
 
+// Whether a texture specifies point sampling (TEXTUREFLAGS_POINTSAMPLE = 0x1).
+bool texturePointSample(const std::string &name) {
+  const std::string path = vtfPath(name);
+  std::vector<uint8_t> header;
+  if ((!fs::read(path, header, 0, 64) || header.size() < 24) &&
+      (!fs::engineReadFile(path, header, 0, 64) || header.size() < 24))
+    return false;
+  if (std::memcmp(header.data(), "VTF", 4) != 0)
+    return false;
+  uint32_t flags = 0;
+  std::memcpy(&flags, header.data() + 20, 4);
+  return (flags & 0x1) != 0;
+}
+
 // A texture's mean colour, as stored (0..1, no gamma): its smallest mip, or
 // the whole image of one without mips. False for a missing file or a format
 // not read here.
@@ -700,6 +714,7 @@ struct Material {
   uint8_t alphaRef = 179;
   MaterialRef ref;
   bool resolved = false;
+  bool pointSample = false;
 };
 
 struct Geometry {
@@ -1755,6 +1770,7 @@ int materialByName(const std::string &name, bool brush) {
       return slot;
     }
     m.noCull = flag("$nocull");
+    m.pointSample = flag("$pointsample") || flag("$point");
     if (kv.values.count("$alphatestreference")) {
       const float r = float(std::atof(kv.values["$alphatestreference"].c_str()));
       if (r > 0)
@@ -1763,6 +1779,8 @@ int materialByName(const std::string &name, bool brush) {
     if (kv.values.count("$basetexture")) {
       m.baseTexture = lower(kv.values["$basetexture"]);
       m.candidates = textureHashes(m.baseTexture);
+      if (!m.pointSample)
+        m.pointSample = texturePointSample(m.baseTexture);
     }
     if (emissiveEnabled())
       m.shading = materialShading(kv, m.maskCandidates);
@@ -1856,6 +1874,7 @@ SecondLayer secondLayer(int base, bool use) {
     m.categories |= categories::lookup(h);
   m.categories &= ~uint32_t(REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE | REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN);
   m.noCull = g_world.materials[base].noCull;
+  m.pointSample = g_world.materials[base].pointSample || texturePointSample(kv.values["$basetexture2"]);
   if (m.candidates.empty()) {
     ++stats.noHash;
   } else {
@@ -2333,6 +2352,9 @@ int overlayMaterial(const std::string &name, bool &modulate) {
     return slot;
   m.modulate = kv.shader == "decalmodulate";
   m.noCull = std::atoi(kv.values["$nocull"].c_str()) != 0;
+  m.pointSample = (std::atoi(kv.values["$pointsample"].c_str()) != 0 ||
+                   std::atoi(kv.values["$point"].c_str()) != 0) ||
+                  texturePointSample(kv.values["$basetexture"]);
   m.baseTexture = lower(kv.values["$basetexture"]);
   m.candidates = textureHashes(m.baseTexture);
   for (uint64_t h : m.candidates)
@@ -3723,13 +3745,13 @@ void submit(MaterialLookup lookup) {
       const bool emissive = shading.mode != engine_materials::Shading::Lit || shading.pbr.active;
       const bool variant = emissive || shading.reflectionReceiverKey;
       for (uint64_t h : m.candidates) {
-        auto ref = lookup(h, variant ? &shading : nullptr, &m.maskCandidates);
+        auto ref = lookup(h, variant ? &shading : nullptr, &m.maskCandidates, m.pointSample);
         if (!ref.handle && emissive && frame >= 600) {
           auto fallback = shading;
           fallback.mode = engine_materials::Shading::Lit;
           fallback.pbr = {};
           fallback.mask.clear();
-          ref = lookup(h, fallback.reflectionReceiverKey ? &fallback : nullptr, nullptr);
+          ref = lookup(h, fallback.reflectionReceiverKey ? &fallback : nullptr, nullptr, m.pointSample);
           if (ref.handle) m.maskDropped = true;
         }
         if (ref.handle) {

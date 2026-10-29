@@ -19,8 +19,23 @@ in Forward+ and keep diffuse-only shading in path tracing. Authored PBR values,
 water and shared USD replacements retain their own roughness and metalness.
 The conversion reuses existing textures; it does not generate missing surface detail.
 
+## Forward+ development handoff
+
+Forward+ development uses `forward-plus-renderer` in this repository and OpenRemix.
+Start with the native renderer's
+[current handoff](https://github.com/OpenRenderCollective/OpenRemix/blob/forward-plus-renderer/docs/features/forward-plus-handoff.md),
+[lighting architecture](https://github.com/OpenRenderCollective/OpenRemix/blob/forward-plus-renderer/docs/architecture/forward-lighting.md)
+and [roadmap](https://github.com/OpenRenderCollective/OpenRemix/blob/forward-plus-renderer/docs/features/forward-plus-roadmap.md).
+The handoff distinguishes pushed source from the older playable installation.
+
+Source shader names, VMT interpretation, entity classification and light-style
+translation belong in this adapter. Lighting providers and the standard material
+shading interface belong in the game-agnostic native renderer. Opt-in adapter
+material programs and HLSL/single-file shader authoring are planned, not implemented;
+the existing PBR conversion and shared replacement system remain the normal path.
+
 ## Build
-This is primarily built on Linux, Windows support is largely untested.
+Linux cross-build:
 
     meson setup --cross-file cross/x86_64-w64-mingw32.txt _build
     meson compile -C _build

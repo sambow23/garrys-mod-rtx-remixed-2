@@ -35,10 +35,18 @@ material programs and HLSL/single-file shader authoring are planned, not impleme
 the existing PBR conversion and shared replacement system remain the normal path.
 
 ## Build
-Linux cross-build:
+See the [fresh-clone setup](https://github.com/OpenRenderCollective/OpenRemix/blob/forward-plus-renderer/docs/features/forward-plus-setup.md)
+for toolchains, optional SDKs and native runtime builds. Linux cross-build requires
+MinGW-w64 GCC, Meson/Ninja and `glslangValidator` on PATH. With sibling clones and
+SDL dependencies built by OpenRemix's tracked Linux dependency script:
 
-    meson setup --cross-file cross/x86_64-w64-mingw32.txt _build
-    meson compile -C _build
+```sh
+native=$(realpath ../OpenRemix)
+meson setup --cross-file cross/x86_64-w64-mingw32.txt _build \
+  "-Dopenremix_include=$native/public/include" \
+  "-Dsdl_include=$native/_work/deps/linux/prefix/include"
+meson compile -C _build
+```
 
 Deploy: rename `bin/win64/shaderapidx9.dll` to `shaderapidx9_orig.dll` and copy
 `_build/shaderapidx9.dll` in its place.
@@ -52,11 +60,12 @@ destinations are refused, and installed files are never replaced or linked.
 The source installation must already contain `shaderapidx9_orig.dll`.
 
 ```powershell
-python tools/stage_game.py --source 'E:/SteamLibrary/steamapps/common/GarrysMod' `
+# Replace the game path with your own installation.
+python tools/stage_game.py --source 'C:/path/to/GarrysMod' `
   --destination _work/staging/gmod-forwardplus `
   --proxy _work/build/forwardplus/shaderapidx9.dll `
-  --runtime D:/OpenRemix/_work/build/forwardplus/src/native/remix.dll `
-  --sdl D:/OpenRemix/_work/build/forwardplus/subprojects/SDL3-3.4.14/SDL3_shared.dll
+  --runtime ../OpenRemix/_work/build/windows/src/native/remix.dll `
+  --sdl ../OpenRemix/_work/deps/windows/prefix/bin/SDL3.dll
 ```
 
 This layout supports the minimal native runtime without OpenUSD; builds with

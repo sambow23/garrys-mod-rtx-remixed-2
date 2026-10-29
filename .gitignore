@@ -1,2 +1,7 @@
 _build/
 deps/dxso/_native/
+
+# Local build outputs, reports and Python interpreter caches.
+/_work/
+__pycache__/
+*.py[cod]

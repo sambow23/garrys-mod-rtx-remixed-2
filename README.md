@@ -48,6 +48,18 @@ meson setup --cross-file cross/x86_64-w64-mingw32.txt _build \
 meson compile -C _build
 ```
 
+The tracked convenience helper runs the same Linux cross-build with checked header
+paths and tools:
+
+```sh
+python3 tools/build_proxy.py --dry-run
+python3 tools/build_proxy.py --jobs 4
+```
+
+Defaults use the sibling `OpenRemix` clone and its `_work/deps/linux/prefix/include`.
+Use `--native-root`, `--sdl-include` and `--build` for another layout. It can be
+called from any working directory, downloads nothing and does not deploy.
+
 Deploy: rename `bin/win64/shaderapidx9.dll` to `shaderapidx9_orig.dll` and copy
 `_build/shaderapidx9.dll` in its place.
 

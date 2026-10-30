@@ -1825,6 +1825,9 @@ bool install(HMODULE module) {
 }
 
 bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+const void *boundTargetTexture() {
+  return g_renderTargetTexture && g_targetTextures.count(g_renderTargetTexture) ? g_renderTargetTexture : nullptr;
+}
 bool targetTexture(const void *texture, uint32_t &width, uint32_t &height, uint32_t &format) {
   auto it = g_targetTextures.find(texture);
   if (it == g_targetTextures.end())

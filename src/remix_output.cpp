@@ -72,7 +72,7 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, opaqueTranslucent{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
@@ -347,7 +347,120 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness, boo
   return slot;
 }
 
+// Screen cameras (remixapi_CameraScreensEXT): views the engine draws a world
+// into a render-target texture (render.RenderView into an RT camera's target,
+// at its "world_lists" marker), by that texture. A draw of the main view that
+// samples one (the camera's monitor) gets a screen material showing its slot:
+// the runtime traces what the camera sees there, instead of the texture's
+// rasterized contents. A view not drawn again for kScreenFrames frames frees
+// its slot.
+struct ScreenView {
+  float view[16], projection[16];
+  uint64_t frame = 0;
+  uint32_t slot = 0;
+};
+std::unordered_map<const void *, ScreenView> g_screenViews; // render thread
+// During a screen draw (onDraw): its base texture transform, two rows taking
+// (u, v, 0, 1) to the coordinates the shader samples with (Source's vertex
+// shaders take $basetexturetransform in c48 and c49: a func_monitor's
+// "gmod fix" scales its brush coordinates by 2 about the centre). The mesh's
+// coordinates are made those (buildMesh), so they name the camera's image.
+const float *g_screenUv = nullptr;
+// Screen-view instances left out (onPresent), by reason: raster only, blended
+// in world space, stencil, placed already; with a texture of each.
+uint64_t g_screenSkipped[4] = {};
+std::string g_screenSkippedExample[4];
+// The last screen draw's coordinates as stored and as made (statistics).
+float g_screenUvRange[8] = {1e30f, -1e30f, 1e30f, -1e30f, 1e30f, -1e30f, 1e30f, -1e30f}; // raw u, v; made u, v
+float g_screenUvRows[8] = {};
+std::string g_screenMaterial;
+remixapi_MaterialHandle g_screenMaterials[REMIXAPI_SCREEN_CAMERA_SLOTS_EXT] = {};
+constexpr uint64_t kScreenFrames = 30;
+
+// At a "world_lists 1" marker drawn into a render-target texture: that view's
+// matrices (left-handed, as world views are stored).
+void noteScreenView(const void *target, const float view[16], const float projection[16]) {
+  auto it = g_screenViews.find(target);
+  if (it == g_screenViews.end()) {
+    bool used[REMIXAPI_SCREEN_CAMERA_SLOTS_EXT] = {};
+    for (const auto &[texture, v] : g_screenViews)
+      used[v.slot] = true;
+    uint32_t slot = 0;
+    while (slot < REMIXAPI_SCREEN_CAMERA_SLOTS_EXT && used[slot])
+      ++slot;
+    if (slot == REMIXAPI_SCREEN_CAMERA_SLOTS_EXT) {
+      ++g_stats.screenViewsFull;
+      return;
+    }
+    it = g_screenViews.emplace(target, ScreenView{}).first;
+    it->second.slot = slot;
+  }
+  std::memcpy(it->second.view, view, sizeof(it->second.view));
+  std::memcpy(it->second.projection, projection, sizeof(it->second.projection));
+  it->second.frame = g_frame;
+}
+
+// The screen slot of a render-target texture a view was drawn into lately (-1: none).
+int screenSlot(const void *texture) {
+  const auto it = texture ? g_screenViews.find(texture) : g_screenViews.end();
+  return it != g_screenViews.end() && g_frame - it->second.frame <= kScreenFrames ? int(it->second.slot) : -1;
+}
+
+// The material of a screen showing `slot`: black where the camera is not
+// traced (a reflection of the screen, no raster primary).
+remixapi_MaterialHandle screenMaterial(int slot) {
+  remixapi_MaterialHandle &handle = g_screenMaterials[slot];
+  if (!handle) {
+    remixapi_MaterialInfoScreenCameraEXT screen = {};
+    screen.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_SCREEN_CAMERA_EXT;
+    screen.slot = uint32_t(slot);
+    remixapi_MaterialInfoOpaqueEXT opaque = {};
+    opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.pNext = &screen;
+    opaque.albedoConstant = {.02f, .02f, .02f};
+    opaque.opacityConstant = 1;
+    opaque.roughnessConstant = 1;
+    opaque.alphaTestType = 7;
+    remixapi_MaterialInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+    info.pNext = &opaque;
+    info.hash = 0x5c4ee7ca3e4a0000ull + uint64_t(slot);
+    if (g_api.CreateMaterial(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+      handle = nullptr;
+  }
+  return handle;
+}
+
+// This frame's screen cameras, for the world camera; forgets old views.
+std::vector<remixapi_ScreenCameraEXT> screenCameras() {
+  std::vector<remixapi_ScreenCameraEXT> out;
+  for (auto it = g_screenViews.begin(); it != g_screenViews.end();) {
+    if (g_frame - it->second.frame > kScreenFrames) {
+      it = g_screenViews.erase(it);
+      continue;
+    }
+    const float *v = it->second.view, *p = it->second.projection;
+    remixapi_ScreenCameraEXT c = {};
+    c.slot = it->second.slot;
+    float eye[3];
+    for (int i = 0; i < 3; ++i)
+      eye[i] = -(v[12] * v[i * 4] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
+    c.position = {eye[0], eye[1], eye[2]};
+    c.right = {v[0], v[4], v[8]};
+    c.up = {v[1], v[5], v[9]};
+    c.forward = {v[2], v[6], v[10]};
+    c.fovYDegrees = p[5] > 0 ? 2 * std::atan(1 / p[5]) * 180 / 3.14159265f : 0;
+    c.aspect = p[0] > 0 ? p[5] / p[0] : 0;
+    if (c.fovYDegrees > 0 && c.fovYDegrees < 180 && c.aspect > 0)
+      out.push_back(c);
+    ++it;
+  }
+  return out;
+}
+
 remixapi_MaterialHandle materialFor(const void *texture, float skyBrightness = 0, bool nearest = false) {
+  if (const int slot = screenSlot(texture); slot >= 0)
+    return screenMaterial(slot);
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
   return it == g_textures.end() ? nullptr : ensureMaterial(*it->second, skyBrightness, nearest);
@@ -798,6 +911,8 @@ void countPbr(const PbrMaps &maps) {
 // with the material's PBR conversion.
 remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s, bool nearest = false) {
   using engine_materials::Shading;
+  if (const int slot = screenSlot(texture); slot >= 0)
+    return screenMaterial(slot);
   const bool tinted = s.albedo[0] != 1 || s.albedo[1] != 1 || s.albedo[2] != 1;
   if (s.mode == Shading::Lit && !s.pbr.active && !tinted)
     return materialFor(texture, 0, nearest);
@@ -1068,6 +1183,10 @@ struct Instance {
   std::vector<remixapi_Transform> bones; // skinned instances
   float transform[3][4];
   uint64_t view;
+  bool skinned = false;     // a skinned model's draw (bones may still be dropped: single-bone models are rigid)
+  bool modelLayer = false;  // a layer the proxy adds to a model (an eye's iris): of the model whatever its transform
+  uint32_t primitives = 0, firstIndex = 0; // the draw's primitive count and first index (a screen view's dedupe)
+  bool offTarget = false; // drawn into a render-target texture: a screen camera's view (role Screen) or nothing
   // Stencil emulation: the draw's group (g_stencilGroups index) and part in it.
   int stencilGroup = -1;
   uint8_t stencilRole = 0;
@@ -1169,6 +1288,9 @@ struct View {
   bool cameraSpace = false;
   float view[16], projection[16];
   float cameraToWorld[3][4] = {}; // a view with a camera: its camera space (as the engine has it) to world
+  // Drawn into a screen camera's render-target texture (screenSlot): the
+  // entities that camera sees, which the main view may not draw.
+  const void *screenTarget = nullptr;
 };
 // Source's client-side particle manager (CParticleMgr: the emitters of FX_
 // effects, env_smokestack, Lua's ParticleEmitter, ...) transforms its
@@ -1848,6 +1970,16 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         std::memcpy(out.texcoord, t, 8);
       if (!std::isfinite(out.texcoord[0]) || !std::isfinite(out.texcoord[1]))
         out.texcoord[0] = out.texcoord[1] = 0;
+      if (g_screenUv) {
+        const float u = out.texcoord[0], v = out.texcoord[1];
+        out.texcoord[0] = g_screenUv[0] * u + g_screenUv[1] * v + g_screenUv[3];
+        out.texcoord[1] = g_screenUv[4] * u + g_screenUv[5] * v + g_screenUv[7];
+        const float values[4] = {u, v, out.texcoord[0], out.texcoord[1]};
+        for (int k = 0; k < 4; ++k) {
+          g_screenUvRange[2 * k] = std::min(g_screenUvRange[2 * k], values[k]);
+          g_screenUvRange[2 * k + 1] = std::max(g_screenUvRange[2 * k + 1], values[k]);
+        }
+      }
     }
     if (nrm && nrm->Type == D3DDECLTYPE_UBYTE4) {
       if (const uint8_t *n = fetch(nrm, v, 4))
@@ -3421,7 +3553,7 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     Instance inst;
     inst.mesh = mesh;
     inst.texture0 = d.texture0;
-    if (d.texture0Target)
+    if (d.texture0Target && screenSlot(d.texture0) < 0)
       d3d::requestTargetContents(d.texture0);
     inst.blend = blendState(d);
     if (premultiplied) { // see above: the alpha factor moves from the shader to the blend
@@ -3460,6 +3592,9 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     static const float identity[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
     std::memcpy(inst.transform, cameraToWorld ? cameraToWorld : identity, sizeof(inst.transform));
     inst.view = viewKey;
+    inst.offTarget = !d.mainTarget;
+    inst.primitives = d.primCount;
+    inst.firstIndex = d.startIndex;
     const bool marks = stencilRole(d, inst); // sets the depth state of stencil draws
     inst.depthTest = d.depthTest && inst.depthTest;
     inst.depthWrite = d.zWrite && !d.blend;
@@ -3717,6 +3852,24 @@ bool opaqueTranslucent(const Draw &d) {
 }
 
 void onDraw(const Draw &d) {
+  // A screen camera's monitor (screenSlot): an opaque surface the runtime
+  // traces the camera's view on, however the engine blends the texture.
+  if (d.texture0Target && d.mainTarget && (d.blend || d.alphaTest) && screenSlot(d.texture0) >= 0) {
+    Draw screen = d;
+    screen.blend = screen.alphaTest = false;
+    ++g_stats.screenDraws;
+    float uv[8] = {1, 0, 0, 0, 0, 1, 0, 0};
+    const float *rows = d.vsConstants + 48 * 4;
+    if (std::all_of(rows, rows + 8, [](float x) { return std::isfinite(x); }) &&
+        (rows[0] != 0 || rows[1] != 0) && (rows[4] != 0 || rows[5] != 0))
+      std::copy_n(rows, 8, uv);
+    g_screenUv = uv;
+    std::copy_n(uv, 8, g_screenUvRows);
+    g_screenMaterial = engine_materials::currentName();
+    onDraw(screen);
+    g_screenUv = nullptr;
+    return;
+  }
   if (opaqueTranslucent(d)) {
     Draw opaque = d;
     opaque.blend = false;
@@ -3788,7 +3941,11 @@ void onDraw(const Draw &d) {
     if ((!perspective || custom) && hostpass::recordDraw(d, projection))
       return;
   }
-  if (!d.mainTarget) {
+  // A screen camera's view (render.RenderView, a point_camera): its scene
+  // draws are taken like the main view's (role Screen), so what only that
+  // camera sees is in the scene.
+  const bool screenView = !d.mainTarget && d.target && screenSlot(d.target) >= 0;
+  if (!d.mainTarget && !screenView) {
     // The engine's depth pass (addons' depth buffers): the runtime's own depth
     // stands in for the geometry.
     if (d.target && material.known && nameStarts(material.shader, "depthwrite") && hostpass::recordDepth(d))
@@ -3953,6 +4110,7 @@ void onDraw(const Draw &d) {
     view.order = g_viewOrder++;
     getMatrix(kMatrixView, view.view);
     getMatrix(kMatrixProjection, view.projection);
+    view.screenTarget = screenView ? d.target : nullptr;
     // Source builds right-handed D3DX matrices (row vectors, camera looking
     // down -z, projection m[2][3] = -1, depth 0..1). Flipping view-space z
     // (negate the view's third column and the projection's third row) keeps
@@ -3978,6 +4136,8 @@ void onDraw(const Draw &d) {
         view.projection[8 + c] = -view.projection[8 + c];
     }
   }
+  if (!view.perspective && view.screenTarget)
+    return; // a screen view's 2D draws: in its image only
   if (!view.perspective) {
     ++g_stats.flat; // HUD / VGUI
     dumpFlat(d);
@@ -4241,6 +4401,8 @@ void onDraw(const Draw &d) {
                   (unlitColors ? 0xc0105c0105c0105ull : 0) ^ (decalColors ? 0x0decac0105c0105ull : 0) ^
                   (hueColors ? 0x4e0c0105c0105ull : 0) ^
                   (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+  if (g_screenUv)
+    hash = fnv(g_screenUv, 8 * sizeof(float), hash);
   // A flexed draw (see flexScale) changes every frame although its own
   // buffers are static. `flexContent` names this frame's deltas: the flex
   // mesh's place and version (0: at rest).
@@ -4386,7 +4548,7 @@ void onDraw(const Draw &d) {
   }
   if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
     ++g_stats.emissiveNoTexture;
-  if (d.texture0Target)
+  if (d.texture0Target && screenSlot(d.texture0) < 0)
     d3d::requestTargetContents(d.texture0);
   inst.blend = blendState(d);
   // The modulation colour: the entity's render colour and alpha (a tinted
@@ -4511,6 +4673,10 @@ void onDraw(const Draw &d) {
     g_stats.rigidModels += boneCount == 1;
   }
   inst.view = instanceView;
+  inst.offTarget = !d.mainTarget;
+  inst.primitives = d.primCount;
+  inst.firstIndex = d.startIndex;
+  inst.skinned = skinnedDraw;
   if (cameraToWorld) { // see CameraSpace
     if (inst.bones.empty())
       premultiply(cameraToWorld, inst.transform);
@@ -4597,7 +4763,11 @@ void onDraw(const Draw &d) {
     // From buffers the engine rewrites (not seen for eyes) it stays per frame.
     const uint64_t irisHash = (dynamicBuffers ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
     remixapi_MeshHandle irisMesh =
-        irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false, 1, nullptr, flex,
+        // Lifted out of the eyeball: by face normals (an eye has no vertex
+        // normals) these wind as the model's do (faceNormalSign; 1 put the
+        // iris inside it, where only a decal's attachment still found it).
+        irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false,
+                                 faceNormalSign(d.cullMode), nullptr, flex,
                                  d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers)
                      : nullptr;
     if (dynamicBuffers) {
@@ -4627,6 +4797,7 @@ void onDraw(const Draw &d) {
       iris.categories = categories | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
       iris.persistent = !dynamicBuffers;
       iris.replacementHash = 0;
+      iris.modelLayer = true; // its eye may be skinned on the CPU: world-space vertices, no transform
       g_instances.push_back(iris);
       ++g_stats.eyeIrises;
     }
@@ -5053,12 +5224,19 @@ void onPresent() {
     // The 3D skybox keeps its own camera: the runtime draws SKY instances with
     // the sky camera behind the world (raster layer 0, path-traced
     // background), as Source does.
-    enum class Role { Skip, Main, Sky, ViewModel };
+    enum class Role { Skip, Main, Sky, ViewModel, Screen };
     std::unordered_map<uint64_t, Role> roles;
     const View *viewModel = nullptr, *sky = nullptr;
     for (auto &[key, v] : g_views) {
       Role role = Role::Skip;
-      if (key == mainKey) {
+      if (v.screenTarget && key != mainKey && !samePlacement(v.view, main->view)) {
+        // Its camera's own view (not the skybox view drawn into it first, nor
+        // the main camera's scene drawn again into a texture by an effect).
+        const auto it = g_screenViews.find(v.screenTarget);
+        if (it != g_screenViews.end() && v.perspective &&
+            std::equal(v.view, v.view + 16, it->second.view, [](float a, float b) { return std::fabs(a - b) < 1e-3f; }))
+          role = Role::Screen;
+      } else if (key == mainKey) {
         role = Role::Main;
       } else if (v.perspective && samePlacement(v.view, main->view) &&
                  int(std::lround(v.projection[5] * 1000)) == worldFov) {
@@ -5077,7 +5255,7 @@ void onPresent() {
     g_viewSummary.clear();
     for (auto &[key, v] : g_views) {
       char line[160];
-      static const char *const names[] = {"skip", "main", "sky", "viewmodel"};
+      static const char *const names[] = {"skip", "main", "sky", "viewmodel", "screen"};
       snprintf(line, sizeof(line), "    view order %u draws %u persp %d P0 %.3f P5 %.3f P14 %.3f T %.0f %.0f %.0f -> %s\n",
                v.order, v.draws, v.perspective, v.projection[0], v.projection[5], v.projection[14], v.view[12],
                v.view[13], v.view[14], names[int(roles[key])]);
@@ -5129,6 +5307,14 @@ void onPresent() {
       }
     }
     environment.pNext = &medium;
+    // The screen cameras the monitors in view show (noteScreenView).
+    const std::vector<remixapi_ScreenCameraEXT> screens = screenCameras();
+    remixapi_CameraScreensEXT screenList = {};
+    screenList.sType = REMIXAPI_STRUCT_TYPE_CAMERA_SCREENS_EXT;
+    screenList.count = uint32_t(screens.size());
+    screenList.cameras = screens.data();
+    if (!screens.empty())
+      medium.pNext = &screenList;
     remixapi_CameraInfo camera = {};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
     auto setup = [&](remixapi_CameraType type, const View &v) {
@@ -5258,10 +5444,52 @@ void onPresent() {
       if (inst.stencilRole == kStencilInside && inst.depthTest && roles[inst.view] == Role::ViewModel &&
           g_stencilGroups[inst.stencilGroup].glassSources)
         g_stencilGroups[inst.stencilGroup].throughGlass = true;
+    // Screen views add what the scene lacks: models and brushes not already
+    // placed by the main view or another screen (placement: a flexed face's
+    // mesh is rebuilt per draw, so its handle names nothing). Effects, world
+    // decals and particles are the main view's alone; of blended draws only
+    // the layers of models.
+    auto placement = [](const Instance &inst) {
+      const float(*m)[4] = inst.bones.empty() ? inst.transform : inst.bones[0].matrix;
+      // A cached mesh is the same handle in every view; a rebuilt one is named
+      // by its texture (two eyes may share theirs: their meshes differ).
+      // The first index tells a model's parts apart where the place does not
+      // (both eyes of a model skinned on the CPU: world-space, no transform).
+      int64_t at[6] = {int64_t(inst.persistent ? reinterpret_cast<uintptr_t>(inst.mesh)
+                                               : reinterpret_cast<uintptr_t>(inst.texture0)),
+                       int64_t(inst.primitives), int64_t(inst.firstIndex)};
+      for (int r = 0; r < 3; ++r)
+        at[r + 3] = std::isfinite(m[r][3]) ? std::llround(m[r][3] * 4) : 0;
+      return fnv(at, sizeof(at));
+    };
+    std::unordered_set<uint64_t> placed;
+    for (const auto &inst : g_instances)
+      if (roles[inst.view] == Role::Main && !inst.offTarget)
+        placed.insert(placement(inst));
     for (auto &inst : g_instances) {
       const Role role = roles[inst.view];
-      if (role == Role::Skip)
+      if (role == Role::Skip || (inst.offTarget && role != Role::Screen))
         continue;
+      if (role == Role::Screen) {
+        // Blended layers of a model (an eye's iris over its eyeball: skinned,
+        // or rigid with a model transform) come too; world decals and other
+        // blended draws in world space do not.
+        static const float worldSpace[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+        const bool modelLayer = inst.modelLayer || inst.skinned || !inst.bones.empty() ||
+                                std::memcmp(inst.transform, worldSpace, sizeof(worldSpace)) != 0;
+        const int reason = inst.rasterOnly ? 0 : inst.blend.alphaBlendEnabled && !modelLayer ? 1
+                         : inst.stencilGroup >= 0 ? 2 : !placed.insert(placement(inst)).second ? 3 : -1;
+        if (reason >= 0) {
+          ++g_screenSkipped[reason];
+          if (inst.texture0) {
+            char hex[24];
+            std::snprintf(hex, sizeof(hex), "%016llX", (unsigned long long)textureHash(inst.texture0));
+            g_screenSkippedExample[reason] = hex;
+          }
+          continue;
+        }
+        ++g_stats.screenInstances;
+      }
       if ((role == Role::ViewModel && &g_views[inst.view] != viewModel) ||
           (role == Role::Sky && (&g_views[inst.view] != sky || skyTraced)))
         continue;
@@ -5417,6 +5645,13 @@ void onPresent() {
                                           : static_cast<void *>(&blend);
       info.mesh = inst.mesh;
       info.categoryFlags = inst.categories;
+      // What only a screen camera sees (Breen in his studio, the player's own
+      // body): reflection-only, so the main camera does not see it and the
+      // screen's rays and bounces do (the runtime's camera rays of a screen
+      // include reflection-only instances; its paint, an eye's iris, coats
+      // only reflection-only receivers).
+      if (role == Role::Screen)
+        info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY;
       if (role == Role::ViewModel && rasterViewModel)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
       else if (role == Role::Sky)
@@ -6250,9 +6485,31 @@ void dumpStatistics(FILE *out) {
           g_stats.badRange.exchange(0) / f, g_stats.cacheHits.exchange(0) / f, g_stats.created.exchange(0) / f,
           g_stats.transient.exchange(0) / f, g_stats.evicted.exchange(0) / f, g_stats.rigidModels.exchange(0) / f);
   fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f | $translucent "
-               "world draws with an opaque texture, drawn opaque %.1f\n",
+               "world draws with an opaque texture, drawn opaque %.1f | screen camera draws %.1f (views %zu, "
+               "refused for want of a slot %.1f; instances only screen views see %.1f)\n",
           g_stats.bspDropped.exchange(0) / f, g_stats.bspKeptBlended.exchange(0) / f,
-          g_stats.bspKeptDynamic.exchange(0) / f, g_stats.opaqueTranslucent.exchange(0) / f);
+          g_stats.bspKeptDynamic.exchange(0) / f, g_stats.opaqueTranslucent.exchange(0) / f,
+          g_stats.screenDraws.exchange(0) / f, g_screenViews.size(), g_stats.screenViewsFull.exchange(0) / f,
+          g_stats.screenInstances.exchange(0) / f);
+  fprintf(out, "   last screen draw (%s): c48 %g %g %g %g c49 %g %g %g %g | u %g..%g v %g..%g -> u %g..%g v %g..%g (built "
+               "meshes only)\n",
+          g_screenMaterial.c_str(), g_screenUvRows[0], g_screenUvRows[1], g_screenUvRows[2], g_screenUvRows[3],
+          g_screenUvRows[4], g_screenUvRows[5], g_screenUvRows[6], g_screenUvRows[7], g_screenUvRange[0],
+          g_screenUvRange[1], g_screenUvRange[2], g_screenUvRange[3], g_screenUvRange[4], g_screenUvRange[5],
+          g_screenUvRange[6], g_screenUvRange[7]);
+  for (int k = 0; k < 4; ++k)
+    g_screenUvRange[2 * k] = 1e30f, g_screenUvRange[2 * k + 1] = -1e30f;
+  fprintf(out, "   screen-view instances left out (since the last dump): raster only %llu (%s), blended in world space "
+               "%llu (%s), stencil %llu (%s), placed already %llu (%s)\n",
+          (unsigned long long)g_screenSkipped[0], g_screenSkippedExample[0].c_str(),
+          (unsigned long long)g_screenSkipped[1], g_screenSkippedExample[1].c_str(),
+          (unsigned long long)g_screenSkipped[2], g_screenSkippedExample[2].c_str(),
+          (unsigned long long)g_screenSkipped[3], g_screenSkippedExample[3].c_str());
+  std::fill_n(g_screenSkipped, 4, 0ull);
+  for (const auto &c : screenCameras())
+    fprintf(out, "   screen camera %u: at %.0f %.0f %.0f forward %.2f %.2f %.2f up %.2f %.2f %.2f fovY %.1f aspect %.2f\n",
+            c.slot, c.position.x, c.position.y, c.position.z, c.forward.x, c.forward.y, c.forward.z, c.up.x, c.up.y,
+            c.up.z, c.fovYDegrees, c.aspect);
   fprintf(out, "   dropped for the BSP world: static prop draws %.1f, overlay draws %.1f, func_lod draws %.1f\n",
           g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f,
           g_stats.bspBrushEntitiesDropped.exchange(0) / f);
@@ -6928,6 +7185,25 @@ bool onMarker(const char *text) {
         }
         g_worldViews.push_back(w);
         readSceneFog();
+      }
+    } else if (g_worldLists == 0 && std::atoi(v) && g_shaderApi) {
+      // A view drawn into a render-target texture: a screen camera's.
+      if (const void *target = d3d::boundTargetTexture()) {
+        WorldView w;
+        getMatrix(kMatrixView, w.view);
+        getMatrix(kMatrixProjection, w.projection);
+        if (std::fabs(std::fabs(w.projection[11]) - 1.0f) < 1e-3f && std::fabs(w.projection[15]) < 1e-3f) {
+          if (w.projection[11] < 0) {
+            for (int r = 0; r < 4; ++r)
+              w.view[r * 4 + 2] = -w.view[r * 4 + 2];
+            for (int c = 0; c < 4; ++c)
+              w.projection[8 + c] = -w.projection[8 + c];
+          }
+          // Not the main camera's own view drawn again (an effect's
+          // render.RenderView of the scene, as dev_ssr's): no screen shows it.
+          if (!samePlacement(w.view, g_lastCamera.view))
+            noteScreenView(target, w.view, w.projection);
+        }
       }
     }
     depth(g_worldLists, v);

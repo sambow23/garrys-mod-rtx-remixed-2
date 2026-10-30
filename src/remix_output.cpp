@@ -2242,12 +2242,12 @@ void serviceScreenshotRequest() {
   // Checked every 16th frame: a file system call per frame shows in profiles.
   if (g_frame % 16)
     return;
-  // Dev aid: shaderapi_proxy_ui.request toggles the developer panel as F12
-  // does (posted to the window, whose thread owns the panel's input).
+  // Dev aid: shaderapi_proxy_ui.request toggles the developer panel (posted to
+  // the window, whose thread owns the panel's input).
   const std::wstring ui = g_moduleDir + L"\\shaderapi_proxy_ui.request";
   if (GetFileAttributesW(ui.c_str()) != INVALID_FILE_ATTRIBUTES) {
     DeleteFileW(ui.c_str());
-    PostMessageW(g_gameWindow, WM_KEYUP, VK_F12, 0);
+    PostMessageW(g_gameWindow, remix_ui::kToggleMessage, 0, 0);
   }
   const std::wstring request = g_moduleDir + L"\\remix_screenshot.request";
   if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)

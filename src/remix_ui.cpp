@@ -206,14 +206,9 @@ void inject(Input type, uint32_t code, bool down, float x = 0, float y = 0, floa
   push(&e);
 }
 
-void pump() {
-  const remixapi_ErrorCode r = g_api->PumpEvents();
-  if (r != REMIXAPI_ERROR_CODE_SUCCESS)
-    g_pumpError = int(r);
-}
-
-void toggle() {
-  g_active = !g_active;
+// Opens or closes the panel on the proxy's side: input capture and cursor.
+void setActive(bool active) {
+  g_active = active;
   ++g_toggles;
   if (g_active) {
     // Drop what SDL's own window procedure queued while nobody pumped.
@@ -225,9 +220,24 @@ void toggle() {
       g_y = float(p.y);
     }
   }
-  g_api->SetUIState(g_active ? REMIXAPI_UI_STATE_ADVANCED : REMIXAPI_UI_STATE_NONE);
   inject(Input::Focus, 0, g_active);
   setCursorVisible(g_active);
+}
+
+// The runtime handles its own shortcuts (the panel's, screenshots, scene
+// captures) while pumping: follow the panel state it leaves.
+void pump() {
+  const remixapi_ErrorCode r = g_api->PumpEvents();
+  if (r != REMIXAPI_ERROR_CODE_SUCCESS)
+    g_pumpError = int(r);
+  const bool open = g_api->GetUIState && g_api->GetUIState() != REMIXAPI_UI_STATE_NONE;
+  if (open != g_active)
+    setActive(open);
+}
+
+void toggle() {
+  setActive(!g_active);
+  g_api->SetUIState(g_active ? REMIXAPI_UI_STATE_ADVANCED : REMIXAPI_UI_STATE_NONE);
   pump();
 }
 
@@ -257,19 +267,28 @@ bool forward(UINT message, WPARAM w, LPARAM l) {
 }
 
 LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
-  if (w == VK_F12 && (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN ||
-                      message == WM_SYSKEYUP)) {
-    if (message == WM_KEYUP || message == WM_SYSKEYUP)
-      toggle();
+  if (message == kToggleMessage) {
+    toggle();
     return 0;
   }
-  if (g_active) {
+  const bool key = message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP;
+  const bool repeat = (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && (l & (1 << 30));
+  if (!g_active && key && !repeat) {
+    // The game keeps its keys; the runtime sees them for its shortcuts, and a
+    // key that opened the panel is the runtime's alone.
+    inject(Input::Key, uint32_t(w), message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
+    pump();
+    if (g_active)
+      return 0;
+  } else if (g_active) {
     if (message == WM_KILLFOCUS || message == WM_SETFOCUS) {
       inject(Input::Focus, 0, message == WM_SETFOCUS);
       pump();
     } else if (forward(message, w, l)) {
       return 0;
     }
+  } else if (message == WM_KILLFOCUS) {
+    g_mods = SDL_KMOD_NONE; // Alt+Tab: Alt's key-up goes to the next window
   } else if (message == WM_SETCURSOR && g_gameProc) {
     // SDL's window procedure answers WM_SETCURSOR with its own cursor (an
     // arrow) on every mouse move over the client area, which the game then
@@ -316,7 +335,7 @@ void open() {
 }
 
 void dumpStatistics(FILE *out) {
-  std::fprintf(out, "   Remix panel (F12): %s; open %d, toggles %u, PumpEvents error %d\n", g_status, int(g_active),
+  std::fprintf(out, "   Remix panel: %s; open %d, toggles %u, PumpEvents error %d\n", g_status, int(g_active),
                g_toggles, g_pumpError);
 }
 

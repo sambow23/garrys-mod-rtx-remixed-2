@@ -24,7 +24,7 @@ Deploy: rename `bin/win64/shaderapidx9.dll` to `shaderapidx9_orig.dll` and copy
 
 ## Launch options
 The Video options' **Advanced...** button is replaced by **OpenRemix
-Settings...**, which opens OpenRemix's settings panel (as F12 does). The
+Settings...**, which opens OpenRemix's settings panel (also Alt+X, the shortcut set in the panel's header). The
 settings the Advanced page held are set on the command line instead (Steam:
 Properties, Launch Options), on one line:
 

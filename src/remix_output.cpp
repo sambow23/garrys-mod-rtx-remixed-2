@@ -72,7 +72,7 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, opaqueTranslucent{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
@@ -3667,7 +3667,46 @@ bool drawShardQuads(const Draw &d, const std::string &mask, const std::string &g
   return true;
 }
 
+// Whether a draw is a $translucent world material blended as Source blends it
+// (src alpha, 1 - src alpha) that shows nothing behind it: its texture's alpha
+// at least 250 everywhere, without vertex alpha or an $alpha below one. Drawn
+// as opaque it is a surface of the scene, which the raster effects drawn after
+// it are hidden behind (gm_area51_rc1's race track sign: the lamps' glows
+// showed through it). Texture opacity cached by name.
+bool opaqueTranslucent(const Draw &d) {
+  if (!d.blend || d.srcBlend != D3DBLEND_SRCALPHA || d.dstBlend != D3DBLEND_INVSRCALPHA ||
+      d.blendOp != D3DBLENDOP_ADD)
+    return false;
+  const auto &m = engine_materials::bound();
+  if (!m.known || !m.lightmapped || !m.translucent || m.additive || m.vertexAlpha || m.decal || m.decalShader)
+    return false;
+  float alpha = 1;
+  if (engine_materials::currentFloat("$alpha", alpha) && alpha < 1)
+    return false;
+  const std::string &base = engine_materials::current().base;
+  if (base.empty())
+    return false;
+  static std::unordered_map<std::string, bool> opaque; // render thread
+  auto [it, added] = opaque.emplace(base, false);
+  if (added) {
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgba;
+    if (bsp::textureRgba(base, width, height, rgba) && !rgba.empty()) {
+      it->second = true;
+      for (size_t i = 3; i < rgba.size() && it->second; i += 4)
+        it->second = rgba[i] >= 250;
+    }
+  }
+  return it->second;
+}
+
 void onDraw(const Draw &d) {
+  if (opaqueTranslucent(d)) {
+    Draw opaque = d;
+    opaque.blend = false;
+    ++g_stats.opaqueTranslucent;
+    return onDraw(opaque);
+  }
   Timer timer(g_usDraw, &g_totalUs[0]);
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
@@ -6194,9 +6233,10 @@ void dumpStatistics(FILE *out) {
           g_stats.noData.exchange(0) / f, g_stats.skinned.exchange(0) / f, g_stats.badPrim.exchange(0) / f,
           g_stats.badRange.exchange(0) / f, g_stats.cacheHits.exchange(0) / f, g_stats.created.exchange(0) / f,
           g_stats.transient.exchange(0) / f, g_stats.evicted.exchange(0) / f, g_stats.rigidModels.exchange(0) / f);
-  fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f\n",
+  fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f | $translucent "
+               "world draws with an opaque texture, drawn opaque %.1f\n",
           g_stats.bspDropped.exchange(0) / f, g_stats.bspKeptBlended.exchange(0) / f,
-          g_stats.bspKeptDynamic.exchange(0) / f);
+          g_stats.bspKeptDynamic.exchange(0) / f, g_stats.opaqueTranslucent.exchange(0) / f);
   fprintf(out, "   dropped for the BSP world: static prop draws %.1f, overlay draws %.1f, func_lod draws %.1f\n",
           g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f,
           g_stats.bspBrushEntitiesDropped.exchange(0) / f);

@@ -1612,6 +1612,16 @@ void captureUi(const Draw &d) {
     return at + bytes <= s.size ? s.data + at : nullptr;
   };
   const float *mvp = d.vsConstants + kRegModelViewProj * 4; // register k = column k
+  // The material's ColorModulate / AlphaModulate ($color, $alpha), which its
+  // shader multiplies in: a screen fade (env_fade, ViewDrawFade) is a white
+  // quad with the fade's colour and opacity there, and was drawn white.
+  float modulation[4] = {1, 1, 1, 1};
+  engine_materials::currentVector("$color", modulation);
+  engine_materials::currentFloat("$alpha", modulation[3]);
+  uint8_t modulate[4];
+  for (int c = 0; c < 4; ++c)
+    modulate[c] = uint8_t(std::lround(std::clamp(modulation[c], 0.0f, 1.0f) * 255));
+  const bool modulated = modulate[0] != 255 || modulate[1] != 255 || modulate[2] != 255 || modulate[3] != 255;
   const uint32_t base = uint32_t(g_uiVertices.size());
   for (uint32_t v = low; v < low + count; ++v) {
     remixapi_UIVertex out = {};
@@ -1633,6 +1643,12 @@ void captureUi(const Draw &d) {
     if (col && col->Type == D3DDECLTYPE_D3DCOLOR)
       if (const uint8_t *c = fetch(col, v, 4)) // memory B, G, R, A -> R in the low byte
         out.color = uint32_t(c[2]) | uint32_t(c[1]) << 8 | uint32_t(c[0]) << 16 | uint32_t(c[3]) << 24;
+    if (modulated) {
+      uint32_t color = 0;
+      for (int c = 0; c < 4; ++c)
+        color |= ((out.color >> (8 * c) & 255) * modulate[c] + 127) / 255 << (8 * c);
+      out.color = color;
+    }
     g_uiVertices.push_back(out);
   }
   // A stencil-tested draw over the whole screen is a masked fill or composite

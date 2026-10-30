@@ -91,6 +91,9 @@ bool currentIsLitOpaque();
 // float or int, or a vector's first component). False when the material was
 // not read or does not define it.
 bool currentFloat(const char *name, float &out);
+// A vector parameter of the bound material by name ("$color"): its three
+// components. False when the material was not read or does not define it.
+bool currentVector(const char *name, float out[3]);
 // The name of the texture the bound material's parameter `name` ("$detail")
 // holds, lower case ("" when none, or not a texture).
 std::string currentTextureName(const char *name);

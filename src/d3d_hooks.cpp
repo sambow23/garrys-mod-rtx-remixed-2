@@ -1181,6 +1181,8 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.mainTarget = g_renderTarget0 == g_backBuffer;
   d.texture0 = g_texture0;
   d.texture1 = g_texture1;
+  for (int s = 0; s < 8; ++s)
+    d.stageTextures[s] = g_textures[s];
   d.colorWrite = g_renderStates[D3DRS_COLORWRITEENABLE];
   d.blend = g_renderStates[D3DRS_ALPHABLENDENABLE] != 0;
   d.srcBlend = g_renderStates[D3DRS_SRCBLEND];
@@ -1859,6 +1861,9 @@ bool install(HMODULE module) {
 }
 
 bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+const void *boundTargetTexture() {
+  return g_renderTargetTexture && g_targetTextures.count(g_renderTargetTexture) ? g_renderTargetTexture : nullptr;
+}
 bool targetTexture(const void *texture, uint32_t &width, uint32_t &height, uint32_t &format) {
   auto it = g_targetTextures.find(texture);
   if (it == g_targetTextures.end())

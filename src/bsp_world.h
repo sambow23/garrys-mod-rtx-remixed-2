@@ -41,6 +41,12 @@ bool waterAt(const float eye[3], float color[3], float &distance);
 // A texture's mean luminance as stored (0..1, gamma; its smallest mip), or
 // -1 when its file is missing or in a format not read. Cached by name.
 float textureLuminance(const std::string &name);
+// A texture's mean colour and alpha as stored (0..1; sRGB values for colour
+// textures), from its VTF. False for a missing file or a format not read.
+bool textureMeanColor(const std::string &name, float rgba[4]);
+// A texture's largest mip (first frame) as RGBA8, R in the lowest byte, from
+// its VTF. False for a missing file or a format not read.
+bool textureRgba(const std::string &name, uint32_t &width, uint32_t &height, std::vector<uint8_t> &rgba);
 
 // Loads `maps/<mapName>.bsp` from the search paths; an empty name unloads.
 // Returns whether the map's world is now provided from the BSP. The host

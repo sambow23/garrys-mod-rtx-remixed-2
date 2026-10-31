@@ -30,6 +30,11 @@ struct Shading {
   bool luminous = false;
   float tint[3] = {1, 1, 1}; // linear multiplier of the emitted colour
   float maskScale = 1;       // emitted share = mask * maskScale (above one: overbright)
+  // The surface's albedo times the texture's (sRGB, as the texture's values):
+  // ShatteredGlass's edge pieces (their mask x the glass's colour). No
+  // opacity: a material opacity below one makes the runtime shade a glass
+  // sheet (transmission from the colour), not the draw's alpha blend.
+  float albedo[3] = {1, 1, 1};
   std::string mask;          // mask texture ("models/x/y_mask"), SelfIllumMask / MaskAlpha
   std::string base;          // $basetexture's name ("" when unknown), also of Lit materials
   pbr::Material pbr;         // its PBR conversion (pbr_rules), of the lit surface shaders
@@ -88,6 +93,12 @@ bool currentIsLitOpaque();
 // float or int, or a vector's first component). False when the material was
 // not read or does not define it.
 bool currentFloat(const char *name, float &out);
+// A vector parameter of the bound material by name ("$color"): its three
+// components. False when the material was not read or does not define it.
+bool currentVector(const char *name, float out[3]);
+// The name of the texture the bound material's parameter `name` ("$detail")
+// holds, lower case ("" when none, or not a texture).
+std::string currentTextureName(const char *name);
 // The bound material's defined parameters, one per line (dev dumps).
 void describeCurrent(FILE *out, const char *indent);
 

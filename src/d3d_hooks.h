@@ -22,6 +22,9 @@ bool install(HMODULE module);
 // Whether render target 0 is the back buffer (render thread): the views the
 // proxy takes draws from.
 bool backBufferBound();
+// The render-target texture render target 0 is (nullptr: the back buffer or
+// another surface). Render thread.
+const void *boundTargetTexture();
 // The scene samples this render-target texture (a scope's lens showing an
 // addon's 2D vignette): its 2D draws are rasterized by D3D and its contents
 // read back (remix::onTargetPixels) while it stays wanted.

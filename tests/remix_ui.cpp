@@ -20,7 +20,12 @@ remixapi_ErrorCode REMIXAPI_CALL setState(remixapi_UIState value) {
 remixapi_ErrorCode REMIXAPI_CALL pump() {
   static const auto poll = function<decltype(&SDL_PollEvent)>("SDL_PollEvent");
   SDL_Event event;
-  while (poll(&event)) events.push_back(event);
+  while (poll(&event)) {
+    events.push_back(event);
+    // Simulate a runtime-selected shortcut, not an adapter-owned fixed F12 key.
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_F6)
+      state = state == REMIXAPI_UI_STATE_NONE ? REMIXAPI_UI_STATE_ADVANCED : REMIXAPI_UI_STATE_NONE;
+  }
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
 void require(bool value, const char *message) {
@@ -49,9 +54,11 @@ int main(int argc, char **argv) {
   remixapi_Interface api{};
   api.SetUIState = setState;
   api.PumpEvents = pump;
+  api.GetUIState = []() -> remixapi_UIState { return state; };
   proxy::remix_ui::install(window, &api, original);
-  SendMessageW(window, WM_KEYUP, VK_F12, 0);
-  require(proxy::remix_ui::active() && state == REMIXAPI_UI_STATE_ADVANCED, "F12 opens the panel");
+  SendMessageW(window, WM_KEYDOWN, VK_F6, 0);
+  require(proxy::remix_ui::active() && state == REMIXAPI_UI_STATE_ADVANCED, "Runtime shortcut opens the panel");
+  SendMessageW(window, WM_KEYUP, VK_F6, 0);
   bool entered = false;
   for (const auto &event : events)
     entered |= event.type == SDL_EVENT_WINDOW_MOUSE_ENTER && event.window.windowID == id(target);
@@ -90,13 +97,13 @@ int main(int argc, char **argv) {
   }
   // SDL can coalesce a leave/enter pair for the same window while polling.
   require(reentered, "Leaving and returning cannot strand the panel in cursor-poll fallback");
-  SendMessageW(window, WM_KEYUP, VK_F12, 0);
-  require(!proxy::remix_ui::active() && state == REMIXAPI_UI_STATE_NONE, "F12 restores the closed state");
+  SendMessageW(window, WM_KEYDOWN, VK_F6, 0);
+  require(!proxy::remix_ui::active() && state == REMIXAPI_UI_STATE_NONE, "Runtime shortcut restores the closed state");
   proxy::remix_ui::uninstall();
   require(reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) == original,
           "Uninstall restores the previous window procedure");
   destroy(unrelated);
   destroy(target);
   quit();
-  std::puts("F12 bridge: packaged SDL module, native-window ownership, motion, click edges and teardown passed");
+  std::puts("Runtime shortcut bridge: packaged SDL module, native-window ownership, motion, click edges and teardown passed");
 }

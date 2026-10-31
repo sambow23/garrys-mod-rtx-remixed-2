@@ -675,6 +675,24 @@ bool currentIsLitOpaque() {
   return flags && !(g_varInt(flags) & kFlagAdditive);
 }
 
+std::string currentTextureName(const char *name) {
+  const Entry *e = g_currentEntry;
+  if (!e)
+    return {};
+  for (int i = 0; i < e->count; ++i) {
+    void *var = paramAt(*e, i);
+    if (!var || varType(var) != kTypeTexture)
+      continue;
+    const char *varName = g_varName(var);
+    if (!varName || _stricmp(varName, name) != 0)
+      continue;
+    void *texture;
+    std::memcpy(&texture, static_cast<const uint8_t *>(var) + kVarTexture, sizeof(texture));
+    return textureNameOfTexture(texture);
+  }
+  return {};
+}
+
 bool currentFloat(const char *name, float &out) {
   const Entry *e = g_currentEntry;
   if (!e)
@@ -693,6 +711,26 @@ bool currentFloat(const char *name, float &out) {
     if (!std::isfinite(value))
       return false;
     out = value;
+    return true;
+  }
+  return false;
+}
+
+bool currentVector(const char *name, float out[3]) {
+  const Entry *e = g_currentEntry;
+  if (!e)
+    return false;
+  for (int i = 0; i < e->count; ++i) {
+    void *var = paramAt(*e, i);
+    if (!var || varType(var) != kTypeVector)
+      continue;
+    const char *varName = g_varName(var);
+    if (!varName || _stricmp(varName, name) != 0)
+      continue;
+    const float *v = g_varVec(var);
+    if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]))
+      return false;
+    std::copy_n(v, 3, out);
     return true;
   }
   return false;
